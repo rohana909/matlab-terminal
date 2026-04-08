@@ -80,10 +80,10 @@ jobs:
           find dist -type f
 
       - name: Set up MATLAB
-        uses: matlab-actions/setup-matlab@v2
+        uses: matlab-actions/setup-matlab@v3
 
       - name: Build .mltbx
-        uses: matlab-actions/run-command@v2
+        uses: matlab-actions/run-command@v3
         with:
           command: addpath('build'); package("${{ github.ref_name }}")
 
