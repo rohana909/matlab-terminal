@@ -28,13 +28,41 @@ func main() {
 		envVars     envFlags
 		idleTimeout time.Duration
 		readyFile   string
+		mcpMode     bool
+		ecPort      int
+		mwapikey    string
 	)
 
-	flag.StringVar(&token, "token", "", "authentication token (required)")
+	flag.StringVar(&token, "token", "", "authentication token (required for terminal mode)")
 	flag.Var(&envVars, "env", "environment variable in KEY=VALUE format (repeatable)")
 	flag.DurationVar(&idleTimeout, "idle-timeout", 30*time.Second, "exit after this duration with no connections")
 	flag.StringVar(&readyFile, "ready-file", "", "write PID/PORT to this file on startup (closed immediately)")
+	flag.BoolVar(&mcpMode, "mcp", false, "run as MCP server (stdio JSON-RPC)")
+	flag.IntVar(&ecPort, "ec-port", 0, "Embedded Connector port (MCP mode)")
+	flag.StringVar(&mwapikey, "mwapikey", "", "Embedded Connector API key (MCP mode)")
 	flag.Parse()
+
+	// MCP mode: run as an MCP server over stdio, no HTTP/PTY.
+	if mcpMode {
+		if ecPort == 0 {
+			// Fall back to environment variable.
+			if v := os.Getenv("MATLAB_EC_PORT"); v != "" {
+				fmt.Sscanf(v, "%d", &ecPort)
+			}
+		}
+		if mwapikey == "" {
+			mwapikey = os.Getenv("MWAPIKEY")
+		}
+		if ecPort == 0 || mwapikey == "" {
+			log.Fatal("MCP mode requires --ec-port and --mwapikey (or MATLAB_EC_PORT and MWAPIKEY env vars)")
+		}
+		client := NewECClient(ecPort, mwapikey)
+		server := NewMCPServer(client)
+		if err := server.Run(); err != nil {
+			log.Fatalf("MCP server error: %v", err)
+		}
+		return
+	}
 
 	if token == "" {
 		log.Fatal("--token is required")

@@ -6,6 +6,7 @@ classdef Terminal < handle
     %   t = Terminal()                    — docked terminal with default name
     %   t = Terminal(Name="Build")        — docked terminal with custom name
     %   t = Terminal(WindowStyle="normal") — undocked terminal in its own window
+    %   t = Terminal(MCP=true)            — enable MCP server for AI agents
     %   t = Terminal(parent)              — terminal inside an existing figure/panel
     %   delete(t)                         — closes the terminal and kills the server
     %
@@ -21,6 +22,10 @@ classdef Terminal < handle
     %                                  "/bin/bash", "/usr/bin/zsh"
     %                     Windows:     "cmd.exe", "powershell.exe", "pwsh.exe",
     %                                  "wsl.exe"
+    %     MCP         - Enable the MCP (Model Context Protocol) server so
+    %                   AI coding agents (Claude Code, etc.) launched from
+    %                   the terminal can interact with the running MATLAB
+    %                   session. Default: false.
     %
     %   Static methods:
     %     Terminal.version()  — return the installed toolbox version string
@@ -33,6 +38,7 @@ classdef Terminal < handle
     %     t = Terminal(Name="Git", WindowStyle="normal");
     %     t = Terminal(Shell="zsh");
     %     t = Terminal(Shell="powershell.exe");
+    %     t = Terminal(MCP=true);
     %     delete(t);
     %     Terminal.update();
 
@@ -50,6 +56,7 @@ classdef Terminal < handle
         OutQueue cell = {}  % queued messages from JS to send to server (legacy only)
         UseEvents logical = false  % true if R2023a+ event API is available
         ThemeConfig        % cached theme config for re-init on HTML reload
+        MCPCommand         % command to pre-populate in the first session
         ThemePollCount double = 0  % tick counter for periodic theme check
         LastFigureColor    % cached groot DefaultFigureColor for change detection
     end
@@ -75,6 +82,7 @@ classdef Terminal < handle
                 options.Name (1,1) string = "Terminal"
                 options.WindowStyle (1,1) string {mustBeMember(options.WindowStyle, ["docked", "normal"])} = "docked"
                 options.Shell (1,1) string = ""
+                options.MCP (1,1) logical = false
             end
 
             obj.Shell = options.Shell;
@@ -121,10 +129,22 @@ classdef Terminal < handle
             matlabPid = num2str(feature('getpid'));
             matlabRoot = matlabroot;
 
+            % --- Bootstrap the Embedded Connector for MCP ---
+            ecInfo = [];
+            if options.MCP
+                ecInfo = Terminal.ensureEmbeddedConnector();
+            end
+
             % --- Start the server process ---
             readyFile = [tempname, '.txt'];
             args = sprintf('--token "%s" --env "MATLAB_PID=%s" --env "MATLAB_ROOT=%s" --ready-file "%s"', ...
                 obj.AuthToken, matlabPid, matlabRoot, readyFile);
+
+            % Pass EC details to the shell so MCP and CLI tools can use them.
+            if ~isempty(ecInfo)
+                args = sprintf('%s --env "MATLAB_EC_PORT=%d" --env "MWAPIKEY=%s"', ...
+                    args, ecInfo.ecPort, ecInfo.mwapikey);
+            end
 
             logFile = [tempname, '.log'];
             if ispc
@@ -197,6 +217,13 @@ classdef Terminal < handle
             obj.ServerProcess = struct('pid', serverPid, 'port', port);
             obj.BaseURL = sprintf('http://127.0.0.1:%d', port);
             obj.PollSeq = 0;
+
+            % --- Build MCP registration command to pre-populate in terminal ---
+            if ~isempty(ecInfo)
+                mcpJson = sprintf('{"command":"%s","args":["--mcp","--ec-port","%d","--mwapikey","%s"]}', ...
+                    strrep(obj.ServerBinary, '\', '\\'), ecInfo.ecPort, ecInfo.mwapikey);
+                obj.MCPCommand = sprintf('devai launch claude mcp add-json terminal-mcp ''%s'' 2>/dev/null; devai launch claude', mcpJson);
+            end
 
             % Pre-create weboptions to avoid re-parsing every call.
             obj.ReadOpts = weboptions('HeaderFields', {'Authorization', obj.AuthToken}, ...
@@ -449,6 +476,17 @@ classdef Terminal < handle
                     resp = obj.serverPost('/api/create', createReq);
                     if ~isempty(resp) && isfield(resp, 'id')
                         obj.sendToJS(struct('type', 'created', 'id', resp.id));
+                        % Pre-populate MCP registration command in the
+                        % first session. Delayed so the shell prompt is
+                        % ready. Sent without a newline — user hits Enter.
+                        if ~isempty(obj.MCPCommand)
+                            sid = resp.id;
+                            cmd = obj.MCPCommand;
+                            obj.MCPCommand = [];  % only for the first session
+                            mcpTimer = timer('StartDelay', 1.0, ...
+                                'TimerFcn', @(t,~) obj.sendMCPHint(t, sid, cmd));
+                            start(mcpTimer);
+                        end
                     end
                 case 'input'
                     obj.serverPost('/api/input', struct('id', msg.id, 'data', msg.data));
@@ -480,6 +518,16 @@ classdef Terminal < handle
             %SERVERPOST Send a POST request to the Go server.
             url = [obj.BaseURL, endpoint];
             resp = webwrite(url, data, obj.WriteOpts);
+        end
+
+        function sendMCPHint(obj, tmr, sessionId, cmd)
+            %SENDMCPHINT Pre-populate MCP registration command in a session.
+            stop(tmr);
+            delete(tmr);
+            try
+                obj.serverPost('/api/input', struct('id', sessionId, 'data', cmd));
+            catch
+            end
         end
 
         function sendToJS(obj, msg)
@@ -844,6 +892,64 @@ classdef Terminal < handle
                 system(sprintf('kill %d 2>/dev/null', pid));
             end
         end
+
+        function ecInfo = ensureEmbeddedConnector()
+            %ENSUREEMBEDDEDCONNECTOR Start the EC and return connection details.
+            %   Returns a struct with fields ecPort (double) and mwapikey (string),
+            %   or [] if the EC could not be started. Safe to call multiple
+            %   times — skips startup if the EC is already running.
+            persistent cachedInfo
+            if ~isempty(cachedInfo)
+                ecInfo = cachedInfo;
+                return;
+            end
+
+            try
+                % Check if the EC is already running. Worker.start
+                % guards on this.Started internally, but checking first
+                % avoids the "Starting CPP Connector" console output.
+                alreadyRunning = connector.internal.Worker.isMATLABOnline();
+
+                if ~alreadyRunning
+                    % Set MWAPIKEY if not already present.
+                    if isempty(getenv('MWAPIKEY'))
+                        mwapikey = lower(sprintf('%s-%s-%s-%s-%s', ...
+                            dec2hex(randi([0 2^32-1], 1, 1), 8), ...
+                            dec2hex(randi([0 2^16-1], 1, 1), 4), ...
+                            dec2hex(randi([0 2^16-1], 1, 1), 4), ...
+                            dec2hex(randi([0 2^16-1], 1, 1), 4), ...
+                            dec2hex(randi([0 2^48-1], 1, 1), 12)));
+                        setenv('MWAPIKEY', mwapikey);
+                    end
+
+                    % Set MATLAB_LOG_DIR if not already present.
+                    if isempty(getenv('MATLAB_LOG_DIR'))
+                        logDir = fullfile(tempdir, 'matlab-terminal-ec');
+                        if ~exist(logDir, 'dir'), mkdir(logDir); end
+                        setenv('MATLAB_LOG_DIR', logDir);
+                    end
+
+                    % Start the Embedded Connector.
+                    evalc('connector.internal.Worker.start');
+                end
+
+                % Extract port from the connector base URL.
+                baseUrl = connector.getBaseUrl('');
+                ecPort = regexp(baseUrl, ':(\d+)', 'tokens', 'once');
+                ecPort = str2double(ecPort{1});
+                mwapikey = getenv('MWAPIKEY');
+                if ecPort <= 0 || isempty(mwapikey)
+                    ecInfo = [];
+                    return;
+                end
+
+                ecInfo = struct('ecPort', ecPort, 'mwapikey', mwapikey);
+                cachedInfo = ecInfo;
+            catch
+                ecInfo = [];
+            end
+        end
+
 
     end
 end
