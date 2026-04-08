@@ -42,6 +42,9 @@ t = Terminal(Theme="solarized-light");
 % Change theme on the fly
 t.Theme = "monokai";
 
+% Open with AI agent integration (MCP)
+t = Terminal(MCP=true);
+
 % List all running terminals
 Terminal.list()
 
@@ -105,6 +108,7 @@ matlab.addons.uninstall('Terminal')
 - **Environment variables** — Terminal sessions have `MATLAB_PID` and `MATLAB_ROOT` set, allowing CLI tools to discover the running MATLAB instance.
 - **Event API (R2023a+)** — On R2023a and later, uses `sendEventToHTMLSource`/`HTMLEventReceivedFcn` for reliable keystroke delivery with no data loss. Older releases fall back to the Data channel with buffering.
 - **matlab-proxy compatible** — Works in browser-based MATLAB via [matlab-proxy](https://github.com/mathworks/matlab-proxy).
+- **AI agent integration (MCP)** — Open a terminal with `Terminal(MCP=true)` to enable [Model Context Protocol](https://modelcontextprotocol.io/) support. AI coding agents like Claude Code gain tools to evaluate MATLAB code, read open editor files, inspect selections, and query workspace variables — all in the running desktop session. See [MCP.md](MCP.md) for details.
 - **Zero runtime dependencies** — No Node.js®, Python®, or Java® required. A single Go binary handles all PTY management.
 
 ### Release-Dependent Behavior
@@ -303,7 +307,7 @@ matlab-terminal/
 │       ├── terminal.css            # Tab bar, theme, loading overlay styles
 │       └── lib/xterm/              # Vendored xterm.js + fit addon
 ├── server/                         # Go server source
-│   ├── main.go                     # Entry point, CLI flags, HTTP routes
+│   ├── main.go                     # Entry point, CLI flags, HTTP routes, MCP mode
 │   ├── api.go                      # HTTP API handlers (create, input, resize, poll)
 │   ├── session.go                  # PTY session lifecycle
 │   ├── pty.go                      # Platform-agnostic PTY interface
@@ -312,6 +316,10 @@ matlab-terminal/
 │   ├── shell_unix.go               # Default shell detection (Unix)
 │   ├── shell_windows.go            # Default shell detection (Windows)
 │   ├── auth.go                     # Token validation middleware
+│   ├── matlab_client.go            # MATLABClient interface (EC abstraction)
+│   ├── ec.go                       # Embedded Connector HTTPS client
+│   ├── mcp.go                      # MCP JSON-RPC transport (stdio)
+│   ├── mcp_tools.go                # MCP tool definitions and handlers
 │   └── go.mod / go.sum             # Go dependencies
 ├── build/                          # Build tooling (not shipped in .mltbx)
 │   ├── build_assets.m              # Bundles web assets + binary into .mat
@@ -324,6 +332,7 @@ matlab-terminal/
 │   ├── win64/                      # Windows binary
 │   └── Terminal.mltbx              # Installable toolbox package
 ├── DESIGN.md                       # Architecture decisions and security analysis
+├── MCP.md                          # MCP integration architecture and tools reference
 ├── SECURITY.md                     # Vulnerability reporting and security details
 └── README.md
 ```
