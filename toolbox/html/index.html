@@ -631,6 +631,14 @@
                 } else {
                     activeTabId = null;
                 }
+            } else if (activeTabId && tabs[activeTabId]) {
+                // Closing a non-active tab's close button steals focus from
+                // the xterm textarea.  Re-focus so keystrokes keep flowing.
+                setTimeout(function () {
+                    if (tabs[activeTabId]) {
+                        tabs[activeTabId].terminal.focus();
+                    }
+                }, 10);
             }
         }
 

@@ -7,12 +7,15 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/UserExistsError/conpty"
 )
 
 type windowsPTY struct {
-	cpty *conpty.ConPty
+	cpty   *conpty.ConPty
+	mu     sync.Mutex
+	closed bool
 }
 
 func startPTY(shell string, cols, rows uint16) (ptyProcess, error) {
@@ -31,13 +34,20 @@ func (p *windowsPTY) Resize(cols, rows uint16) error {
 }
 
 func (p *windowsPTY) Close() error {
-	p.cpty.Close()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.closed {
+		p.closed = true
+		p.cpty.Close()
+	}
 	return nil
 }
 
 func (p *windowsPTY) Kill() error {
-	p.cpty.Close()
-	return nil
+	// On Windows, ConPTY has no separate kill — closing the pseudo-console
+	// handle terminates the child process. Delegate to Close which is
+	// guarded against double-close.
+	return p.Close()
 }
 
 func (p *windowsPTY) Wait() (int, error) {
