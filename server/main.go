@@ -28,12 +28,14 @@ func main() {
 		envVars     envFlags
 		idleTimeout time.Duration
 		readyFile   string
+		staticDir   string
 	)
 
 	flag.StringVar(&token, "token", "", "authentication token (--token or MATLAB_TERMINAL_TOKEN env var)")
 	flag.Var(&envVars, "env", "environment variable in KEY=VALUE format (repeatable)")
 	flag.DurationVar(&idleTimeout, "idle-timeout", 30*time.Second, "exit after this duration with no connections")
 	flag.StringVar(&readyFile, "ready-file", "", "write PID/PORT to this file on startup (closed immediately)")
+	flag.StringVar(&staticDir, "static-dir", "", "serve static files from this directory under /static/")
 	flag.Parse()
 
 	// Prefer env var over CLI flag to avoid leaking the token in the
@@ -77,6 +79,13 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+
+	// Serve static files (HTML, CSS, JS) for embedded browser panels.
+	// No auth required — assets are public; API auth protects the endpoints.
+	if staticDir != "" {
+		fs := http.FileServer(http.Dir(staticDir))
+		mux.Handle("/static/", http.StripPrefix("/static/", fs))
+	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

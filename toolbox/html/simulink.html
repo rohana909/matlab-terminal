@@ -1,0 +1,640 @@
+<!-- Copyright 2026 The MathWorks, Inc. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Terminal</title>
+    <link rel="stylesheet" href="lib/xterm/xterm.css">
+    <link rel="stylesheet" href="terminal.css">
+</head>
+<body>
+    <div id="loading-overlay">
+        <div class="loading-content">
+            <div class="loading-spinner"></div>
+            <div id="loading-title" class="loading-title">Starting Terminal...</div>
+            <div id="loading-shortcuts" class="loading-shortcuts">
+                <table>
+                    <tr><td class="key">Ctrl+Shift+C</td><td>Copy selection</td></tr>
+                    <tr><td class="key">Ctrl+Shift+V</td><td>Paste</td></tr>
+                    <tr><td class="key">exit</td><td>Close terminal</td></tr>
+                </table>
+            </div>
+        </div>
+    </div>
+    <div id="tab-bar">
+        <div id="tabs"></div>
+        <button id="add-tab-btn" title="New Terminal">+</button>
+    </div>
+    <div id="terminal-container"></div>
+
+    <script src="lib/xterm/xterm.js"></script>
+    <script src="lib/xterm/addon-fit.js"></script>
+    <script>
+    (function () {
+        'use strict';
+
+        // ---------------------
+        // URL Parameter Bootstrap
+        // ---------------------
+        var params = new URLSearchParams(window.location.search);
+        var AUTH_TOKEN = params.get('t') || '';
+        var BASE_URL = window.location.origin;
+        var AUTH_HEADERS = { 'Authorization': AUTH_TOKEN };
+        var JSON_HEADERS = { 'Authorization': AUTH_TOKEN, 'Content-Type': 'application/json' };
+
+        // Parse theme from URL param (JSON-encoded by MATLAB).
+        var themeConfig = null;
+        try {
+            var themeParam = params.get('theme');
+            if (themeParam) {
+                themeConfig = JSON.parse(themeParam);
+            }
+        } catch (e) {
+            // Not valid JSON — ignore, use defaults.
+        }
+
+        // Strip token from URL bar for security.
+        if (params.has('t')) {
+            var cleanParams = new URLSearchParams(params);
+            cleanParams.delete('t');
+            cleanParams.delete('theme');
+            var cleanUrl = cleanParams.toString()
+                ? window.location.pathname + '?' + cleanParams.toString()
+                : window.location.pathname;
+            try { history.replaceState(null, null, cleanUrl); } catch (e) {}
+        }
+
+        // ---------------------
+        // State
+        // ---------------------
+        var tabs = {};
+        var activeTabId = null;
+        var tabCounter = 0;
+        var pollSeq = 0;
+        var pollTimer = null;
+
+        var tabsEl = document.getElementById('tabs');
+        var addTabBtn = document.getElementById('add-tab-btn');
+        var containerEl = document.getElementById('terminal-container');
+
+        // ---------------------
+        // Server Communication
+        // ---------------------
+        function serverPost(endpoint, body) {
+            return fetch(BASE_URL + endpoint, {
+                method: 'POST',
+                headers: JSON_HEADERS,
+                body: JSON.stringify(body)
+            }).then(function (resp) {
+                if (!resp.ok) throw new Error('Server error: ' + resp.status);
+                return resp.json();
+            });
+        }
+
+        function serverGet(endpoint) {
+            return fetch(BASE_URL + endpoint, {
+                headers: AUTH_HEADERS
+            }).then(function (resp) {
+                if (!resp.ok) throw new Error('Server error: ' + resp.status);
+                return resp.json();
+            });
+        }
+
+        // ---------------------
+        // Input Buffering
+        // ---------------------
+        var inputBuffer = {};
+        var inputFlushTimer = null;
+
+        function bufferInput(id, data) {
+            if (!inputBuffer[id]) {
+                inputBuffer[id] = '';
+            }
+            inputBuffer[id] += data;
+
+            if (!inputFlushTimer) {
+                inputFlushTimer = setTimeout(flushInput, 50);
+            }
+        }
+
+        function flushInput() {
+            inputFlushTimer = null;
+            var ids = Object.keys(inputBuffer);
+            for (var i = 0; i < ids.length; i++) {
+                var id = ids[i];
+                if (inputBuffer[id]) {
+                    var data = inputBuffer[id];
+                    inputBuffer[id] = '';
+                    serverPost('/api/input', { id: id, data: data }).catch(function () {});
+                }
+            }
+        }
+
+        // ---------------------
+        // Output Polling
+        // ---------------------
+        function startPolling() {
+            if (pollTimer) return;
+            pollTimer = setInterval(pollOutput, 100);
+        }
+
+        function stopPolling() {
+            if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+        }
+
+        function pollOutput() {
+            serverGet('/api/poll?since=' + pollSeq)
+                .then(function (resp) {
+                    if (!resp.messages) return;
+                    var msgs = resp.messages;
+                    if (!Array.isArray(msgs)) {
+                        msgs = [msgs];
+                    }
+                    var hasExited = false;
+                    for (var i = 0; i < msgs.length; i++) {
+                        var m = msgs[i];
+                        if (m.seq > pollSeq) {
+                            pollSeq = m.seq;
+                        }
+                        if (m.type === 'output') {
+                            writeOutput(m.id, m.data);
+                        } else if (m.type === 'exited') {
+                            markTabExited(m.id, m.exitCode);
+                            hasExited = true;
+                        }
+                    }
+                    if (hasExited) {
+                        checkAllExited();
+                    }
+                })
+                .catch(function () {
+                    // Server may be shutting down — ignore.
+                });
+        }
+
+        // ---------------------
+        // Theme
+        // ---------------------
+        function hexToRgb(hex) {
+            var result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            return result ? {
+                r: parseInt(result[1], 16),
+                g: parseInt(result[2], 16),
+                b: parseInt(result[3], 16)
+            } : null;
+        }
+
+        function adjustBrightness(rgb, amount) {
+            var r = Math.max(0, Math.min(255, rgb.r + amount));
+            var g = Math.max(0, Math.min(255, rgb.g + amount));
+            var b = Math.max(0, Math.min(255, rgb.b + amount));
+            return '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+        }
+
+        function applyTheme(theme) {
+            if (!theme) return;
+            var root = document.documentElement;
+            if (!theme.isDark) {
+                root.classList.add('light');
+            } else {
+                root.classList.remove('light');
+            }
+            if (theme.background) root.style.setProperty('--bg-color', theme.background);
+            if (theme.foreground) root.style.setProperty('--fg-color', theme.foreground);
+            if (theme.fontFamily) root.style.setProperty('--font-family', theme.fontFamily);
+            if (theme.fontSize) root.style.setProperty('--font-size', theme.fontSize + 'px');
+
+            if (theme.background) {
+                var rgb = hexToRgb(theme.background);
+                if (rgb) {
+                    if (theme.isDark) {
+                        root.style.setProperty('--tab-bg', adjustBrightness(rgb, 18));
+                        root.style.setProperty('--tab-bg-active', theme.background);
+                        root.style.setProperty('--tab-border', adjustBrightness(rgb, 30));
+                        root.style.setProperty('--tab-fg', adjustBrightness(rgb, 120));
+                        root.style.setProperty('--tab-fg-active', '#ffffff');
+                        root.style.setProperty('--tab-hover-bg', adjustBrightness(rgb, 24));
+                        root.style.setProperty('--scrollbar-thumb', adjustBrightness(rgb, 40));
+                    } else {
+                        root.style.setProperty('--tab-bg', adjustBrightness(rgb, -8));
+                        root.style.setProperty('--tab-bg-active', theme.background);
+                        root.style.setProperty('--tab-border', adjustBrightness(rgb, -18));
+                        root.style.setProperty('--tab-fg', adjustBrightness(rgb, -100));
+                        root.style.setProperty('--tab-fg-active', '#1e1e1e');
+                        root.style.setProperty('--tab-hover-bg', adjustBrightness(rgb, -12));
+                        root.style.setProperty('--scrollbar-thumb', adjustBrightness(rgb, -30));
+                    }
+                }
+            }
+        }
+
+        function buildXtermTheme(theme) {
+            if (!theme) return {};
+            var xt = {
+                background: theme.background || '#1e1e1e',
+                foreground: theme.foreground || '#d4d4d4',
+                cursor: theme.cursor || '#ffffff',
+                cursorAccent: theme.cursorAccent || theme.background || '#1e1e1e',
+                selectionBackground: theme.selectionBackground || '#264f78'
+            };
+            var ansiKeys = [
+                'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
+                'brightBlack', 'brightRed', 'brightGreen', 'brightYellow',
+                'brightBlue', 'brightMagenta', 'brightCyan', 'brightWhite'
+            ];
+            for (var i = 0; i < ansiKeys.length; i++) {
+                if (theme[ansiKeys[i]]) {
+                    xt[ansiKeys[i]] = theme[ansiKeys[i]];
+                }
+            }
+            return xt;
+        }
+
+        // ---------------------
+        // Output Handling
+        // ---------------------
+        function writeOutput(id, base64Data) {
+            var entry = tabs[id];
+            if (!entry) return;
+            try {
+                var raw = atob(base64Data);
+            } catch (e) {
+                return;
+            }
+            var bytes = new Uint8Array(raw.length);
+            for (var i = 0; i < raw.length; i++) {
+                bytes[i] = raw.charCodeAt(i);
+            }
+            entry.terminal.write(bytes);
+        }
+
+        function markTabExited(id, exitCode) {
+            var entry = tabs[id];
+            if (!entry) return;
+            entry.exited = true;
+            closeTab(id);
+        }
+
+        function checkAllExited() {
+            if (Object.keys(tabs).length === 0) {
+                stopPolling();
+            }
+        }
+
+        // ---------------------
+        // Tab Management
+        // ---------------------
+        function createTab() {
+            tabCounter++;
+            var tempName = 'Terminal ' + tabCounter;
+
+            var tabEl = document.createElement('div');
+            tabEl.className = 'tab';
+            tabEl.innerHTML =
+                '<span class="tab-label">' + tempName + '</span>' +
+                '<button class="tab-close" title="Close">&times;</button>';
+
+            var wrapper = document.createElement('div');
+            wrapper.className = 'terminal-wrapper';
+            containerEl.appendChild(wrapper);
+
+            var terminal = new Terminal({
+                fontFamily: (themeConfig && themeConfig.fontFamily) || 'Consolas, monospace',
+                fontSize: (themeConfig && themeConfig.fontSize) || 14,
+                theme: buildXtermTheme(themeConfig),
+                cursorBlink: true,
+                allowProposedApi: true
+            });
+
+            var fitAddon = new FitAddon.FitAddon();
+            terminal.loadAddon(fitAddon);
+            terminal.open(wrapper);
+
+            tabsEl.appendChild(tabEl);
+            switchToWrapper(wrapper, tabEl);
+
+            setTimeout(function () {
+                fitAddon.fit();
+            }, 50);
+
+            // Get dimensions after fit, then create session on server.
+            var dims = fitAddon.proposeDimensions();
+            var cols = (dims && dims.cols) || 80;
+            var rows = (dims && dims.rows) || 24;
+
+            serverPost('/api/create', { cols: cols, rows: rows })
+                .then(function (resp) {
+                    if (resp && resp.id) {
+                        finalizeTab(resp.id, terminal, fitAddon, wrapper, tabEl);
+                    }
+                })
+                .catch(function (err) {
+                    terminal.write('\r\nFailed to create session: ' + err.message + '\r\n');
+                });
+        }
+
+        function finalizeTab(id, terminal, fitAddon, wrapper, tabEl) {
+            var entry = {
+                terminal: terminal,
+                fitAddon: fitAddon,
+                wrapper: wrapper,
+                tab: tabEl,
+                exited: false
+            };
+            tabs[id] = entry;
+
+            // Hide loading overlay once first tab is ready.
+            var overlay = document.getElementById('loading-overlay');
+            if (overlay) overlay.classList.add('hidden');
+            tabEl.dataset.tabId = id;
+            activeTabId = id;
+
+            tabEl.addEventListener('click', function (e) {
+                if (e.target.classList.contains('tab-close')) return;
+                switchTab(id);
+            });
+
+            tabEl.querySelector('.tab-close').addEventListener('click', function (e) {
+                e.stopPropagation();
+                closeTab(id);
+            });
+
+            // Keystrokes -> buffer -> server
+            terminal.onData(function (data) {
+                if (!entry.exited) {
+                    bufferInput(id, data);
+                }
+            });
+
+            // Resize -> server
+            terminal.onResize(function (size) {
+                serverPost('/api/resize', { id: id, cols: size.cols, rows: size.rows })
+                    .catch(function () {});
+            });
+
+            // Copy/Paste: Ctrl+Shift+C / Ctrl+Shift+V
+            if (navigator.clipboard) {
+                terminal.attachCustomKeyEventHandler(function (e) {
+                    if (e.ctrlKey && e.shiftKey && e.type === 'keydown') {
+                        if (e.key === 'C') {
+                            try {
+                                var sel = terminal.getSelection();
+                                if (sel) navigator.clipboard.writeText(sel);
+                            } catch (err) {}
+                            return false;
+                        }
+                        if (e.key === 'V') {
+                            try {
+                                navigator.clipboard.readText().then(function (text) {
+                                    if (text && !entry.exited) bufferInput(id, text);
+                                });
+                            } catch (err) {}
+                            return false;
+                        }
+                    }
+                    return true;
+                });
+            }
+
+            // Force layout reflow then fit.
+            void wrapper.offsetHeight;
+            fitAddon.fit();
+
+            // Send initial size.
+            var dims = fitAddon.proposeDimensions();
+            if (dims) {
+                serverPost('/api/resize', { id: id, cols: dims.cols, rows: dims.rows })
+                    .catch(function () {});
+            }
+
+            terminal.focus();
+
+            // Delayed fit calls to catch late layout changes.
+            function delayedFitAndResize() {
+                fitAddon.fit();
+                terminal.refresh(0, terminal.rows - 1);
+                var d = fitAddon.proposeDimensions();
+                if (d && d.cols > 0 && d.rows > 0) {
+                    serverPost('/api/resize', { id: id, cols: d.cols, rows: d.rows })
+                        .catch(function () {});
+                }
+            }
+            setTimeout(function () {
+                delayedFitAndResize();
+                terminal.focus();
+            }, 100);
+            setTimeout(delayedFitAndResize, 500);
+            setTimeout(delayedFitAndResize, 1500);
+
+            // Start polling if not already running.
+            startPolling();
+        }
+
+        function reconnectTab(id, scrollbackBase64) {
+            tabCounter++;
+            var tabName = 'Terminal ' + tabCounter;
+
+            var tabEl = document.createElement('div');
+            tabEl.className = 'tab';
+            tabEl.innerHTML =
+                '<span class="tab-label">' + tabName + '</span>' +
+                '<button class="tab-close" title="Close">&times;</button>';
+
+            var wrapper = document.createElement('div');
+            wrapper.className = 'terminal-wrapper';
+            containerEl.appendChild(wrapper);
+
+            var terminal = new Terminal({
+                fontFamily: (themeConfig && themeConfig.fontFamily) || 'Consolas, monospace',
+                fontSize: (themeConfig && themeConfig.fontSize) || 14,
+                theme: buildXtermTheme(themeConfig),
+                cursorBlink: true,
+                allowProposedApi: true
+            });
+
+            var fitAddon = new FitAddon.FitAddon();
+            terminal.loadAddon(fitAddon);
+            terminal.open(wrapper);
+
+            // Replay scrollback to restore previous output.
+            if (scrollbackBase64) {
+                try {
+                    var raw = atob(scrollbackBase64);
+                    var bytes = new Uint8Array(raw.length);
+                    for (var j = 0; j < raw.length; j++) {
+                        bytes[j] = raw.charCodeAt(j);
+                    }
+                    terminal.write(bytes);
+                } catch (e) {}
+            }
+
+            tabsEl.appendChild(tabEl);
+
+            // Directly finalize with the known session ID.
+            finalizeTab(id, terminal, fitAddon, wrapper, tabEl);
+
+            switchToWrapper(wrapper, tabEl);
+
+            void wrapper.offsetHeight;
+            fitAddon.fit();
+
+            terminal.focus();
+
+            setTimeout(function () {
+                fitAddon.fit();
+                terminal.refresh(0, terminal.rows - 1);
+                terminal.focus();
+            }, 100);
+            setTimeout(function () {
+                fitAddon.fit();
+                terminal.refresh(0, terminal.rows - 1);
+            }, 500);
+        }
+
+        function closeTab(id) {
+            var entry = tabs[id];
+            if (!entry) return;
+
+            if (!entry.exited) {
+                serverPost('/api/close', { id: id }).catch(function () {});
+            }
+
+            entry.terminal.dispose();
+            entry.tab.remove();
+            entry.wrapper.remove();
+            delete tabs[id];
+
+            if (activeTabId === id) {
+                var remaining = Object.keys(tabs);
+                if (remaining.length > 0) {
+                    switchTab(remaining[remaining.length - 1]);
+                } else {
+                    activeTabId = null;
+                }
+            }
+
+            checkAllExited();
+        }
+
+        function switchTab(id) {
+            if (id === activeTabId) return;
+            var entry = tabs[id];
+            if (!entry) return;
+
+            switchToWrapper(entry.wrapper, entry.tab);
+            activeTabId = id;
+
+            setTimeout(function () {
+                void entry.wrapper.offsetHeight;
+                entry.fitAddon.fit();
+                entry.terminal.refresh(0, entry.terminal.rows - 1);
+                entry.terminal.focus();
+            }, 10);
+        }
+
+        function switchToWrapper(wrapper, tabEl) {
+            var wrappers = containerEl.querySelectorAll('.terminal-wrapper');
+            for (var i = 0; i < wrappers.length; i++) {
+                wrappers[i].classList.remove('active');
+            }
+            var allTabs = tabsEl.querySelectorAll('.tab');
+            for (var j = 0; j < allTabs.length; j++) {
+                allTabs[j].classList.remove('active');
+            }
+            wrapper.classList.add('active');
+            tabEl.classList.add('active');
+        }
+
+        // ---------------------
+        // Add Tab Button
+        // ---------------------
+        addTabBtn.addEventListener('click', function () {
+            createTab();
+        });
+
+        // ---------------------
+        // ESC Key Passthrough
+        // ---------------------
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape' && activeTabId && tabs[activeTabId] && !tabs[activeTabId].exited) {
+                e.stopPropagation();
+                e.preventDefault();
+                bufferInput(activeTabId, '\x1b');
+            }
+        }, true);
+
+        // ---------------------
+        // Focus Recovery
+        // ---------------------
+        function refocusActiveTerminal() {
+            if (activeTabId && tabs[activeTabId] && !tabs[activeTabId].exited) {
+                try { window.focus(); } catch (e) {}
+                tabs[activeTabId].terminal.focus();
+            }
+        }
+        document.addEventListener('click', refocusActiveTerminal);
+        window.addEventListener('focus', refocusActiveTerminal);
+        document.addEventListener('focusin', refocusActiveTerminal);
+
+        // ---------------------
+        // Resize Handling
+        // ---------------------
+        var resizeObserver = new ResizeObserver(function () {
+            if (activeTabId && tabs[activeTabId]) {
+                var entry = tabs[activeTabId];
+                entry.fitAddon.fit();
+                entry.terminal.refresh(0, entry.terminal.rows - 1);
+            }
+        });
+        resizeObserver.observe(containerEl);
+
+        // ---------------------
+        // Initialization
+        // ---------------------
+        function initialize() {
+            applyTheme(themeConfig);
+
+            // Check for existing sessions (reconnect after page reload).
+            serverGet('/api/sessions')
+                .then(function (resp) {
+                    if (resp.ids && resp.ids.length > 0) {
+                        var ids = resp.ids;
+                        if (typeof ids === 'string') ids = [ids];
+
+                        // Fetch scrollback for each and reconnect.
+                        var promises = ids.map(function (sid) {
+                            return serverGet('/api/scrollback?id=' + sid)
+                                .then(function (sbResp) {
+                                    return { id: sid, data: sbResp.data || null };
+                                })
+                                .catch(function () {
+                                    return { id: sid, data: null };
+                                });
+                        });
+
+                        Promise.all(promises).then(function (results) {
+                            for (var i = 0; i < results.length; i++) {
+                                reconnectTab(results[i].id, results[i].data);
+                            }
+                        });
+                    } else {
+                        // No existing sessions — create a fresh tab.
+                        createTab();
+                    }
+                })
+                .catch(function () {
+                    // Server may not be ready yet — create a fresh tab.
+                    createTab();
+                });
+        }
+
+        initialize();
+
+    })();
+    </script>
+</body>
+</html>
