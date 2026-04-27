@@ -125,8 +125,12 @@ func main() {
 		defer ticker.Stop()
 		for range ticker.C {
 			if apiHandler.IncrementIdle() >= maxTicks {
-				log.Println("idle timeout reached, shutting down")
-				os.Exit(0)
+				if manager.Count() == 0 {
+					log.Println("idle timeout reached with no active sessions, shutting down")
+					os.Exit(0)
+				}
+				log.Println("idle timeout reached but sessions still active, resetting counter")
+				apiHandler.ResetIdle()
 			}
 		}
 	}()

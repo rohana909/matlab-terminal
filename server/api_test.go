@@ -370,6 +370,49 @@ func TestScrollback_NonexistentSession(t *testing.T) {
 	}
 }
 
+// --- Idle counter tests ---
+
+func TestIncrementIdle_Increments(t *testing.T) {
+	h := newTestHandler()
+
+	if v := h.IncrementIdle(); v != 1 {
+		t.Errorf("first increment = %d, want 1", v)
+	}
+	if v := h.IncrementIdle(); v != 2 {
+		t.Errorf("second increment = %d, want 2", v)
+	}
+}
+
+func TestResetIdle_ResetsCounter(t *testing.T) {
+	h := newTestHandler()
+
+	h.IncrementIdle()
+	h.IncrementIdle()
+	h.IncrementIdle()
+	h.ResetIdle()
+
+	if v := h.IncrementIdle(); v != 1 {
+		t.Errorf("after reset, increment = %d, want 1", v)
+	}
+}
+
+func TestTouch_ResetsIdleCounter(t *testing.T) {
+	h := newTestHandler()
+
+	h.IncrementIdle()
+	h.IncrementIdle()
+
+	// An API call (poll) should reset the counter via touch().
+	req := httptest.NewRequest("GET", "/api/poll?since=0", nil)
+	req.Header = authHeader(testToken)
+	w := httptest.NewRecorder()
+	h.HandlePoll(w, req)
+
+	if v := h.IncrementIdle(); v != 1 {
+		t.Errorf("after touch, increment = %d, want 1", v)
+	}
+}
+
 // --- LastActivity tests ---
 
 func TestLastActivity_UpdatedOnRequest(t *testing.T) {

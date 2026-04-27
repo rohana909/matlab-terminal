@@ -64,6 +64,13 @@ func (h *APIHandler) IncrementIdle() int64 {
 	return h.idleCounter
 }
 
+// ResetIdle resets the idle counter to zero.
+func (h *APIHandler) ResetIdle() {
+	h.mu.Lock()
+	h.idleCounter = 0
+	h.mu.Unlock()
+}
+
 func (h *APIHandler) enqueue(msg outputMessage) {
 	h.mu.Lock()
 	h.seq++

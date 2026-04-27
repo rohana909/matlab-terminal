@@ -33,7 +33,11 @@ func (p *unixPTY) Read(b []byte) (int, error)  { return p.ptmx.Read(b) }
 func (p *unixPTY) Write(b []byte) (int, error) { return p.ptmx.Write(b) }
 func (p *unixPTY) Close() error {
 	if p.cmd.Process != nil {
-		p.cmd.Process.Signal(syscall.SIGTERM)
+		// Send SIGHUP to the entire process group (negative PID).
+		// Interactive bash ignores SIGTERM, but handles SIGHUP by
+		// forwarding it to all jobs before exiting. The child runs
+		// in its own session (setsid), so its PID equals the PGID.
+		syscall.Kill(-p.cmd.Process.Pid, syscall.SIGHUP)
 	}
 	return p.ptmx.Close()
 }
